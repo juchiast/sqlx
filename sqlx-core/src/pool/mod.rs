@@ -54,7 +54,7 @@
 //! [`Pool::acquire`] or
 //! [`Pool::begin`].
 
-use self::inner::SharedPool;
+use self::inner::PoolInner;
 #[cfg(all(
     any(
         feature = "postgres",
@@ -91,7 +91,7 @@ mod options;
 
 pub use self::connection::PoolConnection;
 pub(crate) use self::maybe::MaybePoolConnection;
-pub use self::options::PoolOptions;
+pub use self::options::{PoolConnectionMetadata, PoolOptions};
 
 /// An asynchronous pool of SQLx database connections.
 ///
@@ -240,7 +240,7 @@ pub use self::options::PoolOptions;
 ///
 /// Depending on the database server, a connection will have caches for all kinds of other data as
 /// well and queries will generally benefit from these caches being "warm" (populated with data).
-pub struct Pool<DB: Database>(pub(crate) Arc<SharedPool<DB>>);
+pub struct Pool<DB: Database>(pub(crate) Arc<PoolInner<DB>>);
 
 /// A future that resolves when the pool is closed.
 ///
@@ -280,19 +280,47 @@ impl<DB: Database> Pool<DB> {
 
     /// Retrieves a connection from the pool.
     ///
-    /// Waits for at most the configured connection timeout before returning an error.
+    /// This method has an internal timeout configured by [`PoolOptions::acquire_timeout`],
+    /// which caps the total amount of time this method can spend waiting across multiple phases:
+    ///
+    /// * First, it may need to wait for a permit from the semaphore, which grants it the privilege
+    ///   of opening a connection or popping one from the idle queue.
+    /// * If an existing idle connection is acquired, by default it will be checked for liveness
+    ///   and integrity before being returned, which may require executing a command on the
+    ///   connection. This can be disabled via [`PoolOptions::test_on_acquire`].
+    ///     * If [`PoolOptions::before_acquire`] is set, that will also be executed.
+    /// * If a new connection needs to be opened, that will obviously require I/O, handshaking,
+    ///   and initialization commands.
+    ///     * If [`PoolOptions::after_connect`] is set, that will also be executed.
+    ///
+    /// ### Note: Cancellation/Timeout May Drop Connections
+    /// If `acquire` is cancelled or times out after it acquires a connection from the idle queue or
+    /// opens a new one, it will drop that connection because we don't want to assume it
+    /// is safe to return to the pool, and testing it to see if it's safe to release could introduce
+    /// subtle bugs if not implemented correctly. To avoid that entirely, we've decided to not
+    /// gracefully handle cancellation here.
+    ///
+    /// However, if your workload is sensitive to dropped connections such as using an in-memory
+    /// SQLite database with a pool size of 1, you can pretty easily ensure that a cancelled
+    /// `acquire()` call will never drop connections by tweaking your [`PoolOptions`]:
+    ///
+    /// * Set [`test_before_acquire(false)`][PoolOptions::test_before_acquire]
+    /// * Never set [`before_acquire`][PoolOptions::before_acquire] or
+    ///   [`after_connect`][PoolOptions::after_connect].
+    ///
+    /// This should eliminate any potential `.await` points between acquiring a connection and
+    /// returning it.
     pub fn acquire(&self) -> impl Future<Output = Result<PoolConnection<DB>, Error>> + 'static {
         let shared = self.0.clone();
-        async move { shared.acquire().await.map(|conn| conn.attach(&shared)) }
+        async move { shared.acquire().await.map(|conn| conn.reattach()) }
     }
 
     /// Attempts to retrieve a connection from the pool if there is one available.
     ///
-    /// Returns `None` immediately if there are no idle connections available in the pool.
+    /// Returns `None` immediately if there are no idle connections available in the pool
+    /// or there are tasks waiting for a connection which have yet to wake.
     pub fn try_acquire(&self) -> Option<PoolConnection<DB>> {
-        self.0
-            .try_acquire()
-            .map(|conn| conn.into_live().attach(&self.0))
+        self.0.try_acquire().map(|conn| conn.into_live().reattach())
     }
 
     /// Retrieves a new connection and immediately begins a new transaction.
@@ -312,31 +340,29 @@ impl<DB: Database> Pool<DB> {
         }
     }
 
-    /// Shut down the connection pool, waiting for all connections to be gracefully closed.
+    /// Shut down the connection pool, immediately waking all tasks waiting for a connection.
     ///
-    /// Upon `.await`ing this call, any currently waiting or subsequent calls to [Pool::acquire] and
+    /// Upon calling this method, any currently waiting or subsequent calls to [Pool::acquire] and
     /// the like will immediately return [Error::PoolClosed] and no new connections will be opened.
+    /// Checked-out connections are unaffected, but will be gracefully closed on-drop
+    /// rather than being returned to the pool.
     ///
-    /// Any connections currently idle in the pool will be immediately closed, including sending
-    /// a graceful shutdown message to the database server, if applicable.
+    /// Returns a `Future` which can be `.await`ed to ensure all connections are
+    /// gracefully closed. It will first close any idle connections currently waiting in the pool,
+    /// then wait for all checked-out connections to be returned or closed.
     ///
-    /// Checked-out connections are unaffected, but will be closed in the same manner when they are
-    /// returned to the pool.
+    /// Waiting for connections to be gracefully closed is optional, but will allow the database
+    /// server to clean up the resources sooner rather than later. This is especially important
+    /// for tests that create a new pool every time, otherwise you may see errors about connection
+    /// limits being exhausted even when running tests in a single thread.
     ///
-    /// Does not resolve until all connections are returned to the pool and gracefully closed.
+    /// If the returned `Future` is not run to completion, any remaining connections will be dropped
+    /// when the last handle for the given pool instance is dropped, which could happen in a task
+    /// spawned by `Pool` internally and so may be unpredictable otherwise.
     ///
-    /// ### Note: `async fn`
-    /// Because this is an `async fn`, the pool will *not* be marked as closed unless the
-    /// returned future is polled at least once.
-    ///
-    /// If you want to close the pool but don't want to wait for all connections to be gracefully
-    /// closed, you can do `pool.close().now_or_never()`, which polls the future exactly once
-    /// with a no-op waker.
-    // TODO: I don't want to change the signature right now in case it turns out to be a
-    // breaking change, but this probably should eagerly mark the pool as closed and then the
-    // returned future only needs to be awaited to gracefully close the connections.
-    pub async fn close(&self) {
-        self.0.close().await;
+    /// `.close()` may be safely called and `.await`ed on multiple handles concurrently.
+    pub fn close(&self) -> impl Future<Output = ()> + '_ {
+        self.0.close()
     }
 
     /// Returns `true` if [`.close()`][Pool::close] has been called on the pool, `false` otherwise.

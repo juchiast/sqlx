@@ -1,5 +1,6 @@
 use crate::common::StatementCache;
 use crate::connection::{Connection, LogSettings};
+use crate::database::HasStatementCache;
 use crate::error::Error;
 use crate::executor::Executor;
 use crate::mssql::connection::stream::MssqlStream;
@@ -53,6 +54,10 @@ impl Connection for MssqlConnection {
             // https://docs.rs/tokio/1.0.1/tokio/io/trait.AsyncWriteExt.html#method.shutdown
             async move { self.stream.shutdown().await.map_err(Into::into) }.boxed()
         }
+    }
+
+    fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
+        self.close()
     }
 
     fn ping(&mut self) -> BoxFuture<'_, Result<(), Error>> {

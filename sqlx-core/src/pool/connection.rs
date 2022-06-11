@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_intrusive::sync::SemaphoreReleaser;
 
@@ -9,7 +9,8 @@ use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::Error;
 
-use super::inner::{DecrementSizeGuard, SharedPool};
+use super::inner::{DecrementSizeGuard, PoolInner};
+use crate::pool::options::PoolConnectionMetadata;
 use std::future::Future;
 
 /// A connection managed by a [`Pool`][crate::pool::Pool].
@@ -17,17 +18,17 @@ use std::future::Future;
 /// Will be returned to the pool on-drop.
 pub struct PoolConnection<DB: Database> {
     live: Option<Live<DB>>,
-    pub(crate) pool: Arc<SharedPool<DB>>,
+    pub(crate) pool: Arc<PoolInner<DB>>,
 }
 
 pub(super) struct Live<DB: Database> {
     pub(super) raw: DB::Connection,
-    pub(super) created: Instant,
+    pub(super) created_at: Instant,
 }
 
 pub(super) struct Idle<DB: Database> {
     pub(super) live: Live<DB>,
-    pub(super) since: Instant,
+    pub(super) idle_since: Instant,
 }
 
 /// RAII wrapper for connections being handled by functions that may drop them
@@ -72,12 +73,6 @@ impl<DB: Database> AsMut<DB::Connection> for PoolConnection<DB> {
 }
 
 impl<DB: Database> PoolConnection<DB> {
-    /// Explicitly release a connection from the pool
-    #[deprecated = "renamed to `.detach()` for clarity"]
-    pub fn release(self) -> DB::Connection {
-        self.detach()
-    }
-
     /// Detach this connection from the pool, allowing it to open a replacement.
     ///
     /// Note that if your application uses a single shared pool, this
@@ -86,11 +81,7 @@ impl<DB: Database> PoolConnection<DB> {
     /// If you want the pool to treat this connection as permanently checked-out,
     /// use [`.leak()`][Self::leak] instead.
     pub fn detach(mut self) -> DB::Connection {
-        self.live
-            .take()
-            .expect("PoolConnection double-dropped")
-            .float(self.pool.clone())
-            .detach()
+        self.take_live().float(self.pool.clone()).detach()
     }
 
     /// Detach this connection from the pool, treating it as permanently checked-out.
@@ -99,7 +90,11 @@ impl<DB: Database> PoolConnection<DB> {
     ///
     /// If you don't want to impact the pool's capacity, use [`.detach()`][Self::detach] instead.
     pub fn leak(mut self) -> DB::Connection {
-        self.live.take().expect("PoolConnection double-dropped").raw
+        self.take_live().raw
+    }
+
+    fn take_live(&mut self) -> Live<DB> {
+        self.live.take().expect("PoolConnection double-dropped")
     }
 
     /// Test the connection to make sure it is still live before returning it to the pool.
@@ -112,11 +107,36 @@ impl<DB: Database> PoolConnection<DB> {
         let floating = self.live.take().map(|live| live.float(self.pool.clone()));
 
         async move {
-            let mut floating = if let Some(floating) = floating {
+            // Type hints seem to be broken by the `Option::map()` above.
+            let mut floating: Floating<DB, Live<DB>> = if let Some(floating) = floating {
                 floating
             } else {
                 return;
             };
+
+            // Immediately close the connection.
+            if floating.guard.pool.is_closed() {
+                floating.close().await;
+                return;
+            }
+
+            if let Some(test) = &floating.guard.pool.options.after_release {
+                let meta = floating.metadata();
+                match (test)(&mut floating.inner.raw, meta).await {
+                    Ok(true) => (),
+                    Ok(false) => {
+                        floating.close().await;
+                        return;
+                    }
+                    Err(e) => {
+                        log::warn!("error from after_release: {}", e);
+                        // Connection is broken, don't try to gracefully close as
+                        // something weird might happen.
+                        floating.close_hard().await;
+                        return;
+                    }
+                }
+            }
 
             // test the connection on-release to ensure it is still viable,
             // and flush anything time-sensitive like transaction rollbacks
@@ -131,9 +151,8 @@ impl<DB: Database> PoolConnection<DB> {
                     e
                 );
 
-                // we now consider the connection to be broken; just drop it to close
-                // trying to close gracefully might cause something weird to happen
-                drop(floating);
+                // Connection is broken, don't try to gracefully close.
+                floating.close_hard().await;
             } else {
                 // if the connection is still viable, release it to the pool
                 floating.release();
@@ -158,7 +177,7 @@ impl<DB: Database> Drop for PoolConnection<DB> {
 }
 
 impl<DB: Database> Live<DB> {
-    pub fn float(self, pool: Arc<SharedPool<DB>>) -> Floating<DB, Self> {
+    pub fn float(self, pool: Arc<PoolInner<DB>>) -> Floating<DB, Self> {
         Floating {
             inner: self,
             // create a new guard from a previously leaked permit
@@ -169,7 +188,7 @@ impl<DB: Database> Live<DB> {
     pub fn into_idle(self) -> Idle<DB> {
         Idle {
             live: self,
-            since: Instant::now(),
+            idle_since: Instant::now(),
         }
     }
 }
@@ -193,24 +212,21 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         Self {
             inner: Live {
                 raw: conn,
-                created: Instant::now(),
+                created_at: Instant::now(),
             },
             guard,
         }
     }
 
-    pub fn attach(self, pool: &Arc<SharedPool<DB>>) -> PoolConnection<DB> {
+    pub fn reattach(self) -> PoolConnection<DB> {
         let Floating { inner, guard } = self;
 
-        debug_assert!(
-            guard.same_pool(pool),
-            "BUG: attaching connection to different pool"
-        );
+        let pool = Arc::clone(&guard.pool);
 
         guard.cancel();
         PoolConnection {
             live: Some(inner),
-            pool: Arc::clone(pool),
+            pool,
         }
     }
 
@@ -218,9 +234,15 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         self.guard.pool.clone().release(self);
     }
 
-    pub async fn close(self) -> Result<(), Error> {
+    pub async fn close(self) {
+        // This isn't used anywhere that we care about the return value
+        let _ = self.inner.raw.close().await;
+
         // `guard` is dropped as intended
-        self.inner.raw.close().await
+    }
+
+    pub async fn close_hard(self) {
+        let _ = self.inner.raw.close_hard().await;
     }
 
     pub fn detach(self) -> DB::Connection {
@@ -233,12 +255,19 @@ impl<DB: Database> Floating<DB, Live<DB>> {
             guard: self.guard,
         }
     }
+
+    pub fn metadata(&self) -> PoolConnectionMetadata {
+        PoolConnectionMetadata {
+            age: self.created_at.elapsed(),
+            idle_for: Duration::ZERO,
+        }
+    }
 }
 
 impl<DB: Database> Floating<DB, Idle<DB>> {
     pub fn from_idle(
         idle: Idle<DB>,
-        pool: Arc<SharedPool<DB>>,
+        pool: Arc<PoolInner<DB>>,
         permit: SemaphoreReleaser<'_>,
     ) -> Self {
         Self {
@@ -259,11 +288,26 @@ impl<DB: Database> Floating<DB, Idle<DB>> {
     }
 
     pub async fn close(self) -> DecrementSizeGuard<DB> {
-        // `guard` is dropped as intended
         if let Err(e) = self.inner.live.raw.close().await {
             log::debug!("error occurred while closing the pool connection: {}", e);
         }
         self.guard
+    }
+
+    pub async fn close_hard(self) -> DecrementSizeGuard<DB> {
+        let _ = self.inner.live.raw.close_hard().await;
+
+        self.guard
+    }
+
+    pub fn metadata(&self) -> PoolConnectionMetadata {
+        // Use a single `now` value for consistency.
+        let now = Instant::now();
+
+        PoolConnectionMetadata {
+            age: self.created_at.duration_since(now),
+            idle_for: self.idle_since.duration_since(now),
+        }
     }
 }
 
